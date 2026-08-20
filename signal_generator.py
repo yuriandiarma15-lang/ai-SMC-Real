@@ -92,6 +92,7 @@ class TradeSignal:
     session_note: str
     zone_touched: bool = False
     zone_type: Optional[str] = None
+    fill_status: str = "untouched"
 
 
 # =========================================================
@@ -215,14 +216,64 @@ def _zone_touched_by_recent_price(
     recent_low = min(c.low for c in recent_candles)
     recent_high = max(c.high for c in recent_candles)
 
-    # Overlap check: dua range TIDAK overlap kalau salah satu
-    # sepenuhnya di atas atau di bawah yang lain.
     no_overlap = (
         zone_high < recent_low
         or zone_low > recent_high
     )
 
     return not no_overlap
+
+
+def _fvg_fill_status(
+    direction: str,
+    top: float,
+    bottom: float,
+    recent_candles: List[Candle],
+) -> str:
+    """
+    Status pengisian FVG — ini pembeda penting dari Order Block.
+
+    FVG sering hanya terisi SEBAGIAN (partial fill): harga cuma
+    masuk sedikit ke area gap lalu lanjut ke arah trend. Sisa gap
+    yang belum terisi masih berfungsi sebagai "magnet" -> harga
+    punya kecenderungan balik lagi ke situ sebelum benar-benar
+    melanjutkan trend. Order Block tidak punya karakter seperti ini
+    (sekali diretest dan struktur tetap jalan, biasanya dianggap
+    selesai), makanya FVG butuh penanganan terpisah.
+
+    Return salah satu:
+        "untouched" -> belum pernah disentuh sama sekali
+        "partial"   -> baru wick yang masuk, belum ada CLOSE yang
+                       menembus sisi seberang gap -> gap masih
+                       separuh terbuka, waspada potensi balik lagi
+        "full"      -> sudah ada candle yang CLOSE menembus sisi
+                       seberang gap -> gap dianggap benar-benar
+                       tertutup / termitigasi penuh
+    """
+
+    if not recent_candles:
+        return "untouched"
+
+    touched = _zone_touched_by_recent_price(bottom, top, recent_candles)
+
+    if not touched:
+        return "untouched"
+
+    # FVG bullish = zona demand di bawah harga (dibentuk saat naik).
+    # "Full fill" kalau ada CLOSE yang menembus ke bawah `bottom`,
+    # artinya harga benar-benar melewati seluruh gap, bukan cuma wick.
+    if direction == "bullish":
+        fully_closed_through = any(
+            c.close < bottom for c in recent_candles
+        )
+    else:
+        # FVG bearish = zona supply di atas harga.
+        # "Full fill" kalau ada CLOSE yang menembus ke atas `top`.
+        fully_closed_through = any(
+            c.close > top for c in recent_candles
+        )
+
+    return "full" if fully_closed_through else "partial"
 
 
 # =========================================================
@@ -234,13 +285,17 @@ def _determine_order_type(
     entry_price: float,
     current_price: float,
     has_zone: bool,
-    zone_touched: bool = False,
+    fill_status: str = "untouched",
 ) -> tuple[str, bool]:
 
-    # Zona sudah kejemput / tidak ada zona valid -> selalu market.
+    # Zona sudah tersentuh (partial ATAU full) / tidak ada zona valid
+    # -> selalu market. Partial fill tetap market karena harga sudah
+    # secara fisik berada di zona itu (bukan lagi murni menunggu),
+    # tapi teks alasannya nanti akan beda -> beri warning soal
+    # kemungkinan balik lagi ke sisa gap (lihat entry_reason_bank).
     if (
         not has_zone
-        or zone_touched
+        or fill_status in ("partial", "full")
         or abs(entry_price - current_price) <= MARKET_ENTRY_TOLERANCE
     ):
         return "Market", False
@@ -270,11 +325,14 @@ def _find_entry_zone(
     Cari zona OB/FVG yang paling dekat dengan harga sekarang,
     dalam batas `max_distance`.
 
-    Return: (price, zone_type, zone_touched)
-        - price        : titik tengah zona (dipakai kalau belum kejemput)
-        - zone_type    : "Order Block" / "Fair Value Gap"
-        - zone_touched : True kalau zona ini sudah overlap dengan
-                          range candle M1 terakhir (sudah diretest)
+    Return: (price, zone_type, fill_status, zone_low, zone_high)
+        - price       : titik tengah zona (dipakai kalau belum kejemput)
+        - zone_type   : "Order Block" / "Fair Value Gap"
+        - fill_status : "untouched" / "partial" / "full"
+                        (Order Block hanya pakai "untouched"/"full",
+                        FVG bisa "partial" -> lihat _fvg_fill_status)
+        - zone_low/zone_high : batas zona, buat ditampilkan ke user
+                        biar alasannya konkret pakai angka asli
     """
 
     candidates = []
@@ -289,8 +347,12 @@ def _find_entry_zone(
         touched = _zone_touched_by_recent_price(
             ob.low, ob.high, recent_candles
         )
+        # Order Block tidak punya konsep "partial fill" seperti FVG.
+        status = "full" if touched else "untouched"
 
-        candidates.append((dist, mid, "Order Block", touched))
+        candidates.append(
+            (dist, mid, "Order Block", status, ob.low, ob.high)
+        )
 
     for fvg in smc.fvgs:
         mid = (fvg.top + fvg.bottom) / 2
@@ -299,26 +361,28 @@ def _find_entry_zone(
         if max_distance and dist > max_distance:
             continue
 
-        touched = _zone_touched_by_recent_price(
-            fvg.bottom, fvg.top, recent_candles
+        status = _fvg_fill_status(
+            fvg.direction, fvg.top, fvg.bottom, recent_candles
         )
 
-        candidates.append((dist, mid, "Fair Value Gap", touched))
+        candidates.append(
+            (dist, mid, "Fair Value Gap", status, fvg.bottom, fvg.top)
+        )
 
     if not candidates:
-        return None, None, False
+        return None, None, "untouched", None, None
 
-    # Prioritaskan zona yang BELUM kejemput dan terdekat.
-    # Kalau semua zona dalam radius sudah kejemput, ambil yang
-    # terdekat saja (nanti tetap jadi market entry).
-    untouched = [c for c in candidates if not c[3]]
+    # Prioritaskan zona yang masih "untouched" dan terdekat.
+    # Kalau semua zona dalam radius sudah tersentuh (partial/full),
+    # ambil yang terdekat saja.
+    untouched = [c for c in candidates if c[3] == "untouched"]
 
     pool = untouched if untouched else candidates
     pool.sort(key=lambda x: x[0])
 
-    _, price, zone_type, touched = pool[0]
+    _, price, zone_type, status, zlow, zhigh = pool[0]
 
-    return price, zone_type, touched
+    return price, zone_type, status, zlow, zhigh
 
 
 # =========================================================
@@ -328,14 +392,21 @@ def _find_entry_zone(
 def _build_entry_description(
     order_type: str,
     is_pending: bool,
-    zone_touched: bool,
+    fill_status: str,
+    zone_type: Optional[str] = None,
 ) -> str:
 
     if not is_pending:
-        if zone_touched:
+        if fill_status == "partial" and zone_type == "Fair Value Gap":
             return (
                 "Market "
-                "(zona OB/FVG sudah kejemput/diretest, entry langsung)"
+                "(FVG baru terisi sebagian, waspada potensi harga "
+                "balik mengisi sisa gap sebelum lanjut)"
+            )
+        if fill_status == "full":
+            return (
+                "Market "
+                "(zona sudah kejemput/termitigasi penuh, entry langsung)"
             )
         return (
             "Market "
@@ -413,10 +484,10 @@ def generate_signal(
     )
 
     # =====================================================
-    # FIND ENTRY ZONE (dengan status touched)
+    # FIND ENTRY ZONE (dengan status fill: untouched/partial/full)
     # =====================================================
 
-    zone_price, zone_type, zone_touched = _find_entry_zone(
+    zone_price, zone_type, fill_status, zone_low, zone_high = _find_entry_zone(
         smc, current_price, recent_candles
     )
 
@@ -425,12 +496,14 @@ def generate_signal(
     # =====================================================
     # ENTRY PRICE
     #
-    # - Belum ada zona valid            -> market di harga sekarang
-    # - Zona sudah kejemput/diretest    -> market di harga sekarang
-    # - Zona ada & belum kejemput       -> pending di harga zona
+    # - Belum ada zona valid                -> market di harga sekarang
+    # - Zona full (OB retested / FVG penuh) -> market di harga sekarang
+    # - Zona partial (FVG separuh terisi)   -> market di harga sekarang,
+    #                                          tapi kasih warning di teks
+    # - Zona untouched                      -> pending di harga zona
     # =====================================================
 
-    if has_zone and not zone_touched:
+    if has_zone and fill_status == "untouched":
         entry_price = zone_price
     else:
         entry_price = current_price
@@ -440,11 +513,11 @@ def generate_signal(
         entry_price,
         current_price,
         has_zone,
-        zone_touched,
+        fill_status,
     )
 
     entry_type = _build_entry_description(
-        order_type, is_pending, zone_touched
+        order_type, is_pending, fill_status, zone_type
     )
 
     # =====================================================
@@ -456,10 +529,30 @@ def generate_signal(
             bias=smc.bias,
             zone_type=zone_type,
             is_pending=is_pending,
-            touched=zone_touched,
-            seed=f"{now.isoformat()}-{zone_type}-{smc.bias}",
+            fill_status=fill_status,
+            seed=f"{now.isoformat()}-{zone_type}-{smc.bias}-{fill_status}",
         )
         smc.confluences.append(reason_text)
+
+        # Catatan konkret pakai angka harga asli zona, supaya client
+        # entry punya alasan yang jelas & bisa diverifikasi sendiri,
+        # bukan cuma kalimat umum.
+        if zone_low is not None and zone_high is not None:
+            smc.confluences.append(
+                f"Area {zone_type}: {round(zone_low, 2)} - "
+                f"{round(zone_high, 2)}"
+            )
+
+        # Warning khusus FVG partial fill — ini inti concern kamu:
+        # gap yang baru terisi sebagian masih berpotensi ditarik
+        # balik harga sebelum melanjutkan trend.
+        if fill_status == "partial" and zone_type == "Fair Value Gap":
+            smc.confluences.append(
+                "⚠️ Gap ini belum sepenuhnya tertutup — masih ada "
+                "kemungkinan harga sempat balik lagi ke area ini "
+                "sebelum melanjutkan arah trend. Pertimbangkan "
+                "amankan sebagian posisi di TP1."
+            )
 
     if is_pending:
         smc.confluences.append(
@@ -508,8 +601,9 @@ def generate_signal(
         smc=smc,
         session_name=session_name,
         session_note=session_note,
-        zone_touched=zone_touched,
+        zone_touched=(fill_status != "untouched"),
         zone_type=zone_type,
+        fill_status=fill_status,
     )
 
 
