@@ -16,8 +16,9 @@ Mode:
 """
 
 from dataclasses import dataclass
-from datetime import datetime, timedelta
+from datetime import datetime
 from typing import List, Optional
+from zoneinfo import ZoneInfo
 
 from twelvedata_client import Candle, fetch_candles
 from smc_analyzer import analyze, SMCResult
@@ -37,7 +38,15 @@ from config import (
     SESSIONS,
     MARKET_ENTRY_TOLERANCE,
     PENDING_ORDER_TIMEOUT_MINUTES,
+    TIMEZONE,
 )
+
+
+# =========================================================
+# TIMEZONE
+# =========================================================
+
+WIB = ZoneInfo(TIMEZONE)
 
 
 # =========================================================
@@ -71,6 +80,11 @@ def _get_session_info(dt: datetime) -> tuple[str, str]:
     Tentukan sesi trading berdasarkan jam WIB.
     """
 
+    if dt.tzinfo is None:
+        dt = dt.replace(tzinfo=WIB)
+    else:
+        dt = dt.astimezone(WIB)
+
     hour = dt.hour
 
     for session in SESSIONS:
@@ -84,6 +98,103 @@ def _get_session_info(dt: datetime) -> tuple[str, str]:
         "Trading",
         "pantau pergerakan harga dengan disiplin & manajemen risiko",
     )
+
+
+# =========================================================
+# CANDLE TIME HELPERS
+# =========================================================
+
+def _to_wib(dt: datetime) -> datetime:
+    """
+    Pastikan datetime candle berada dalam timezone WIB.
+
+    Twelve Data dapat mengembalikan datetime timezone-naive
+    tergantung parameter/API response.
+    """
+
+    if dt.tzinfo is None:
+        return dt.replace(tzinfo=WIB)
+
+    return dt.astimezone(WIB)
+
+
+def _get_current_m5_open_time(now: datetime) -> datetime:
+    """
+    Tentukan awal candle M5 yang sedang berjalan.
+
+    Contoh:
+        11:37 -> 11:35
+        11:34 -> 11:30
+        11:30 -> 11:30
+        11:00 -> 11:00
+    """
+
+    now = now.astimezone(WIB)
+
+    minute = (now.minute // 5) * 5
+
+    return now.replace(
+        minute=minute,
+        second=0,
+        microsecond=0,
+    )
+
+
+def _get_closed_m5_candles(
+    candles: List[Candle],
+    count: int,
+) -> List[Candle]:
+    """
+    Ambil `count` candle M5 yang benar-benar sudah CLOSED.
+
+    Candle yang open time-nya sama dengan candle M5 saat ini
+    tidak digunakan.
+
+    Contoh saat 11:37:
+
+        11:35 -> candle berjalan -> BUANG
+        11:30 -> closed
+        11:25 -> closed
+        ...
+    """
+
+    if count <= 0:
+        raise ValueError(
+            "Jumlah candle closed harus lebih besar dari 0."
+        )
+
+    now = datetime.now(WIB)
+
+    current_m5_open = _get_current_m5_open_time(now)
+
+    closed = []
+
+    for candle in candles:
+
+        candle_time = _to_wib(candle.time)
+
+        # Candle hanya dianggap closed kalau
+        # waktu OPEN candle lebih kecil dari
+        # open time candle M5 yang sedang berjalan.
+        if candle_time < current_m5_open:
+            closed.append(candle)
+
+    # Pastikan urutan lama -> baru.
+    closed.sort(
+        key=lambda c: _to_wib(c.time)
+    )
+
+    if len(closed) < count:
+
+        raise ValueError(
+            "Candle M5 closed tidak cukup. "
+            f"Tersedia {len(closed)}, "
+            f"dibutuhkan {count}. "
+            f"Waktu sekarang WIB: "
+            f"{now.strftime('%Y-%m-%d %H:%M:%S')}"
+        )
+
+    return closed[-count:]
 
 
 # =========================================================
@@ -200,7 +311,18 @@ def _build_entry_description(
             "(harga sudah di zona optimal)"
         )
 
-    recent_candles = m1_candles[-10:]
+    recent_candles = (
+        m1_candles[-10:]
+        if len(m1_candles) >= 10
+        else m1_candles
+    )
+
+    if not recent_candles:
+
+        return (
+            f"Pending {order_type} "
+            "(pasang order, tunggu harga menuju zona OB/FVG)"
+        )
 
     recent_low = min(
         c.low for c in recent_candles
@@ -250,25 +372,35 @@ def generate_signal(
     """
 
     # =====================================================
+    # CURRENT TIME WIB
+    # =====================================================
+
+    now = datetime.now(WIB)
+
+    # =====================================================
     # M5 STRUCTURE
     # =====================================================
 
     if structure_candle_count is None:
 
-        m5_outputsize = (
-            CANDLES_LOOKBACK
-        )
+        # Scheduler menggunakan lookback normal.
+        m5_outputsize = CANDLES_LOOKBACK
 
     else:
 
-        # Ambil beberapa candle tambahan
-        # untuk memastikan candle berjalan
-        # bisa dibuang.
-        m5_outputsize = (
-            structure_candle_count + 3
+        # Manual /signal.
+        #
+        # Ambil cukup banyak history supaya kalau candle
+        # terakhir sedang berjalan, kita tetap punya
+        # minimal 12 candle closed.
+        #
+        # 20 candle jauh lebih aman daripada hanya 13.
+        m5_outputsize = max(
+            structure_candle_count + 8,
+            20,
         )
 
-    structure_candles = fetch_candles(
+    structure_raw = fetch_candles(
         interval=TF_STRUCTURE,
         outputsize=m5_outputsize,
     )
@@ -277,62 +409,54 @@ def generate_signal(
     # CHECK DATA
     # =====================================================
 
-    required = (
-        structure_candle_count
-        if structure_candle_count is not None
-        else CANDLES_FOR_STRUCTURE
-    )
-
-    if len(structure_candles) < required:
+    if not structure_raw:
 
         raise ValueError(
-            f"Data candle M5 tidak cukup. "
-            f"Tersedia {len(structure_candles)}, "
-            f"dibutuhkan {required}."
+            "Twelve Data tidak mengembalikan candle M5."
         )
 
     # =====================================================
     # MANUAL /SIGNAL
-    # 12 CANDLE M5 CLOSED
+    #
+    # AMBIL 12 CANDLE M5 CLOSED
     # =====================================================
 
     if structure_candle_count is not None:
 
-        now = datetime.now()
+        structure_candles = _get_closed_m5_candles(
+            structure_raw,
+            structure_candle_count,
+        )
 
-        closed_candles = []
+        # Logging sederhana untuk memastikan candle
+        # yang digunakan memang benar.
+        first_time = _to_wib(
+            structure_candles[0].time
+        )
 
-        for candle in structure_candles:
+        last_time = _to_wib(
+            structure_candles[-1].time
+        )
 
-            candle_start = candle.time.replace(
-                second=0,
-                microsecond=0,
-            )
+        print(
+            "[M5 CLOSED] "
+            f"{len(structure_candles)} candle | "
+            f"{first_time.strftime('%H:%M')} -> "
+            f"{last_time.strftime('%H:%M')} WIB"
+        )
 
-            candle_end = (
-                candle_start
-                + timedelta(minutes=5)
-            )
+    else:
 
-            if candle_end <= now:
-
-                closed_candles.append(
-                    candle
-                )
-
-        if len(closed_candles) < structure_candle_count:
+        # Scheduler tetap menggunakan data sesuai config.
+        if len(structure_raw) < CANDLES_FOR_STRUCTURE:
 
             raise ValueError(
-                "Candle M5 closed tidak cukup. "
-                f"Tersedia {len(closed_candles)}, "
-                f"dibutuhkan {structure_candle_count}."
+                "Data candle M5 tidak cukup. "
+                f"Tersedia {len(structure_raw)}, "
+                f"dibutuhkan {CANDLES_FOR_STRUCTURE}."
             )
 
-        structure_candles = (
-            closed_candles[
-                -structure_candle_count:
-            ]
-        )
+        structure_candles = structure_raw
 
     # =====================================================
     # SMC ANALYSIS
@@ -476,7 +600,7 @@ def generate_signal(
     # TIME / SESSION
     # =====================================================
 
-    now = datetime.now()
+    now = datetime.now(WIB)
 
     session_name, session_note = (
         _get_session_info(now)
@@ -487,6 +611,7 @@ def generate_signal(
     # =====================================================
 
     return TradeSignal(
+
         timestamp=now,
 
         bias=smc.bias,
@@ -649,7 +774,7 @@ def format_signal_message(
 
         "",
 
-        "⚠️ _Signal berbasis analisa AI "
+        "⚠️ _Signal berbasis AI "
         "(SMC), bukan jaminan profit._",
 
         "_Selalu gunakan money management pribadi._",
@@ -688,6 +813,7 @@ def _wrap_reason(
         ):
 
             if current:
+
                 lines.append(
                     current
                 )
