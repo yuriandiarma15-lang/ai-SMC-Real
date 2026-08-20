@@ -13,6 +13,16 @@ Mode:
 - generate_signal(structure_candle_count=12)
     -> dipakai /signal manual
     -> menggunakan 12 candle M5 CLOSED terakhir
+
+PERUBAHAN PENTING (fix entry logic):
+- OB / FVG yang BELUM pernah disentuh harga (M1 terakhir) -> tetap PENDING ORDER
+  di harga zona tersebut (sesuai filosofi SMC: tunggu retest).
+- OB / FVG yang SUDAH disentuh/retest oleh harga -> entry MARKET LANGSUNG
+  di harga sekarang, karena zona sudah "dikonfirmasi" -> tidak perlu pending
+  order lagi ke harga yang sudah dilewati.
+- Ditambahkan MAX_ZONE_DISTANCE supaya zona yang kejauhan dari harga sekarang
+  (biasanya saat trend kuat) tidak dipaksa jadi pending order yang jarang
+  kesentuh -> fallback ke market entry.
 """
 
 from dataclasses import dataclass
@@ -22,6 +32,7 @@ from zoneinfo import ZoneInfo
 
 from twelvedata_client import Candle, fetch_candles
 from smc_analyzer import analyze, SMCResult
+from entry_reason_bank import get_entry_reason, get_session_extra_note
 
 from config import (
     CANDLES_FOR_STRUCTURE,
@@ -40,6 +51,16 @@ from config import (
     PENDING_ORDER_TIMEOUT_MINUTES,
     TIMEZONE,
 )
+
+# Jarak maksimal (dalam satuan harga, sama seperti SL_DISTANCE dst.)
+# antara harga sekarang dengan zona OB/FVG supaya zona itu masih layak
+# dipakai sebagai pending order. Kalau lebih jauh dari ini -> market entry.
+# Sesuaikan nilainya di config.py kalau perlu (kasih default di sini
+# supaya tetap jalan walau belum ditambahkan ke config).
+try:
+    from config import MAX_ZONE_DISTANCE
+except ImportError:
+    MAX_ZONE_DISTANCE = SL_DISTANCE * 1.5  # default: 1.5x jarak SL
 
 
 # =========================================================
@@ -69,6 +90,8 @@ class TradeSignal:
     smc: SMCResult
     session_name: str
     session_note: str
+    zone_touched: bool = False
+    zone_type: Optional[str] = None
 
 
 # =========================================================
@@ -121,16 +144,9 @@ def _to_wib(dt: datetime) -> datetime:
 def _get_current_m5_open_time(now: datetime) -> datetime:
     """
     Tentukan awal candle M5 yang sedang berjalan.
-
-    Contoh:
-        11:37 -> 11:35
-        11:34 -> 11:30
-        11:30 -> 11:30
-        11:00 -> 11:00
     """
 
     now = now.astimezone(WIB)
-
     minute = (now.minute // 5) * 5
 
     return now.replace(
@@ -146,16 +162,6 @@ def _get_closed_m5_candles(
 ) -> List[Candle]:
     """
     Ambil `count` candle M5 yang benar-benar sudah CLOSED.
-
-    Candle yang open time-nya sama dengan candle M5 saat ini
-    tidak digunakan.
-
-    Contoh saat 11:37:
-
-        11:35 -> candle berjalan -> BUANG
-        11:30 -> closed
-        11:25 -> closed
-        ...
     """
 
     if count <= 0:
@@ -164,28 +170,19 @@ def _get_closed_m5_candles(
         )
 
     now = datetime.now(WIB)
-
     current_m5_open = _get_current_m5_open_time(now)
 
     closed = []
 
     for candle in candles:
-
         candle_time = _to_wib(candle.time)
 
-        # Candle hanya dianggap closed kalau
-        # waktu OPEN candle lebih kecil dari
-        # open time candle M5 yang sedang berjalan.
         if candle_time < current_m5_open:
             closed.append(candle)
 
-    # Pastikan urutan lama -> baru.
-    closed.sort(
-        key=lambda c: _to_wib(c.time)
-    )
+    closed.sort(key=lambda c: _to_wib(c.time))
 
     if len(closed) < count:
-
         raise ValueError(
             "Candle M5 closed tidak cukup. "
             f"Tersedia {len(closed)}, "
@@ -198,6 +195,37 @@ def _get_closed_m5_candles(
 
 
 # =========================================================
+# ZONE TOUCH CHECK
+# =========================================================
+
+def _zone_touched_by_recent_price(
+    zone_low: float,
+    zone_high: float,
+    recent_candles: List[Candle],
+) -> bool:
+    """
+    Cek apakah range candle M1 terakhir sudah overlap dengan
+    range zona (OB/FVG). Kalau overlap -> zona dianggap sudah
+    "kejemput" / diretest oleh harga.
+    """
+
+    if not recent_candles:
+        return False
+
+    recent_low = min(c.low for c in recent_candles)
+    recent_high = max(c.high for c in recent_candles)
+
+    # Overlap check: dua range TIDAK overlap kalau salah satu
+    # sepenuhnya di atas atau di bawah yang lain.
+    no_overlap = (
+        zone_high < recent_low
+        or zone_low > recent_high
+    )
+
+    return not no_overlap
+
+
+# =========================================================
 # ORDER TYPE
 # =========================================================
 
@@ -206,27 +234,25 @@ def _determine_order_type(
     entry_price: float,
     current_price: float,
     has_zone: bool,
+    zone_touched: bool = False,
 ) -> tuple[str, bool]:
 
+    # Zona sudah kejemput / tidak ada zona valid -> selalu market.
     if (
         not has_zone
-        or abs(entry_price - current_price)
-        <= MARKET_ENTRY_TOLERANCE
+        or zone_touched
+        or abs(entry_price - current_price) <= MARKET_ENTRY_TOLERANCE
     ):
         return "Market", False
 
     if bias == "bullish":
-
         if entry_price < current_price:
             return "Buy Limit", True
-
         return "Buy Stop", True
 
     else:
-
         if entry_price > current_price:
             return "Sell Limit", True
-
         return "Sell Stop", True
 
 
@@ -237,60 +263,62 @@ def _determine_order_type(
 def _find_entry_zone(
     smc: SMCResult,
     current_price: float,
+    recent_candles: List[Candle],
+    max_distance: float = MAX_ZONE_DISTANCE,
 ):
     """
-    Cari zona OB/FVG yang paling dekat
-    dengan harga sekarang.
+    Cari zona OB/FVG yang paling dekat dengan harga sekarang,
+    dalam batas `max_distance`.
+
+    Return: (price, zone_type, zone_touched)
+        - price        : titik tengah zona (dipakai kalau belum kejemput)
+        - zone_type    : "Order Block" / "Fair Value Gap"
+        - zone_touched : True kalau zona ini sudah overlap dengan
+                          range candle M1 terakhir (sudah diretest)
     """
 
     candidates = []
 
-    # -----------------------------------------------------
-    # ORDER BLOCK
-    # -----------------------------------------------------
-
     for ob in smc.order_blocks:
+        mid = (ob.high + ob.low) / 2
+        dist = abs(current_price - mid)
 
-        mid = (
-            ob.high + ob.low
-        ) / 2
+        if max_distance and dist > max_distance:
+            continue
 
-        candidates.append(
-            (
-                abs(current_price - mid),
-                mid,
-                "Order Block",
-            )
+        touched = _zone_touched_by_recent_price(
+            ob.low, ob.high, recent_candles
         )
 
-    # -----------------------------------------------------
-    # FAIR VALUE GAP
-    # -----------------------------------------------------
+        candidates.append((dist, mid, "Order Block", touched))
 
     for fvg in smc.fvgs:
+        mid = (fvg.top + fvg.bottom) / 2
+        dist = abs(current_price - mid)
 
-        mid = (
-            fvg.top + fvg.bottom
-        ) / 2
+        if max_distance and dist > max_distance:
+            continue
 
-        candidates.append(
-            (
-                abs(current_price - mid),
-                mid,
-                "Fair Value Gap",
-            )
+        touched = _zone_touched_by_recent_price(
+            fvg.bottom, fvg.top, recent_candles
         )
 
+        candidates.append((dist, mid, "Fair Value Gap", touched))
+
     if not candidates:
-        return None, None
+        return None, None, False
 
-    candidates.sort(
-        key=lambda x: x[0]
-    )
+    # Prioritaskan zona yang BELUM kejemput dan terdekat.
+    # Kalau semua zona dalam radius sudah kejemput, ambil yang
+    # terdekat saja (nanti tetap jadi market entry).
+    untouched = [c for c in candidates if not c[3]]
 
-    _, price, zone_type = candidates[0]
+    pool = untouched if untouched else candidates
+    pool.sort(key=lambda x: x[0])
 
-    return price, zone_type
+    _, price, zone_type, touched = pool[0]
+
+    return price, zone_type, touched
 
 
 # =========================================================
@@ -300,49 +328,18 @@ def _find_entry_zone(
 def _build_entry_description(
     order_type: str,
     is_pending: bool,
-    m1_candles: List[Candle],
-    entry_price: float,
+    zone_touched: bool,
 ) -> str:
 
     if not is_pending:
-
+        if zone_touched:
+            return (
+                "Market "
+                "(zona OB/FVG sudah kejemput/diretest, entry langsung)"
+            )
         return (
             "Market "
-            "(harga sudah di zona optimal)"
-        )
-
-    recent_candles = (
-        m1_candles[-10:]
-        if len(m1_candles) >= 10
-        else m1_candles
-    )
-
-    if not recent_candles:
-
-        return (
-            f"Pending {order_type} "
-            "(pasang order, tunggu harga menuju zona OB/FVG)"
-        )
-
-    recent_low = min(
-        c.low for c in recent_candles
-    )
-
-    recent_high = max(
-        c.high for c in recent_candles
-    )
-
-    already_touched = (
-        recent_low
-        <= entry_price
-        <= recent_high
-    )
-
-    if already_touched:
-
-        return (
-            f"Pending {order_type} "
-            "(zona OB/FVG barusan sempat tersentuh)"
+            "(harga sudah di zona optimal / tidak ada zona valid)"
         )
 
     return (
@@ -359,84 +356,28 @@ def generate_signal(
     structure_candle_count: Optional[int] = None,
 ) -> TradeSignal:
 
-    """
-    Generate signal.
-
-    structure_candle_count = None
-        Scheduler normal.
-        Menggunakan CANDLES_LOOKBACK.
-
-    structure_candle_count = 12
-        Digunakan oleh /signal.
-        Menggunakan tepat 12 candle M5 CLOSED terakhir.
-    """
-
-    # =====================================================
-    # CURRENT TIME WIB
-    # =====================================================
-
     now = datetime.now(WIB)
 
-    # =====================================================
-    # M5 STRUCTURE
-    # =====================================================
-
     if structure_candle_count is None:
-
-        # Scheduler menggunakan lookback normal.
         m5_outputsize = CANDLES_LOOKBACK
-
     else:
-
-        # Manual /signal.
-        #
-        # Ambil cukup banyak history supaya kalau candle
-        # terakhir sedang berjalan, kita tetap punya
-        # minimal 12 candle closed.
-        #
-        # 20 candle jauh lebih aman daripada hanya 13.
-        m5_outputsize = max(
-            structure_candle_count + 8,
-            20,
-        )
+        m5_outputsize = max(structure_candle_count + 8, 20)
 
     structure_raw = fetch_candles(
         interval=TF_STRUCTURE,
         outputsize=m5_outputsize,
     )
 
-    # =====================================================
-    # CHECK DATA
-    # =====================================================
-
     if not structure_raw:
-
-        raise ValueError(
-            "Twelve Data tidak mengembalikan candle M5."
-        )
-
-    # =====================================================
-    # MANUAL /SIGNAL
-    #
-    # AMBIL 12 CANDLE M5 CLOSED
-    # =====================================================
+        raise ValueError("Twelve Data tidak mengembalikan candle M5.")
 
     if structure_candle_count is not None:
-
         structure_candles = _get_closed_m5_candles(
-            structure_raw,
-            structure_candle_count,
+            structure_raw, structure_candle_count
         )
 
-        # Logging sederhana untuk memastikan candle
-        # yang digunakan memang benar.
-        first_time = _to_wib(
-            structure_candles[0].time
-        )
-
-        last_time = _to_wib(
-            structure_candles[-1].time
-        )
+        first_time = _to_wib(structure_candles[0].time)
+        last_time = _to_wib(structure_candles[-1].time)
 
         print(
             "[M5 CLOSED] "
@@ -444,31 +385,16 @@ def generate_signal(
             f"{first_time.strftime('%H:%M')} -> "
             f"{last_time.strftime('%H:%M')} WIB"
         )
-
     else:
-
-        # Scheduler tetap menggunakan data sesuai config.
         if len(structure_raw) < CANDLES_FOR_STRUCTURE:
-
             raise ValueError(
                 "Data candle M5 tidak cukup. "
                 f"Tersedia {len(structure_raw)}, "
                 f"dibutuhkan {CANDLES_FOR_STRUCTURE}."
             )
-
         structure_candles = structure_raw
 
-    # =====================================================
-    # SMC ANALYSIS
-    # =====================================================
-
-    smc = analyze(
-        structure_candles
-    )
-
-    # =====================================================
-    # M1 ENTRY
-    # =====================================================
+    smc = analyze(structure_candles)
 
     entry_candles = fetch_candles(
         interval=TF_ENTRY,
@@ -476,84 +402,68 @@ def generate_signal(
     )
 
     if not entry_candles:
+        raise ValueError("Data candle M1 tidak tersedia.")
 
-        raise ValueError(
-            "Data candle M1 tidak tersedia."
-        )
+    current_price = entry_candles[-1].close
 
-    current_price = (
-        entry_candles[-1].close
+    recent_candles = (
+        entry_candles[-10:]
+        if len(entry_candles) >= 10
+        else entry_candles
     )
 
     # =====================================================
-    # FIND ENTRY ZONE
+    # FIND ENTRY ZONE (dengan status touched)
     # =====================================================
 
-    zone_price, zone_type = (
-        _find_entry_zone(
-            smc,
-            current_price,
-        )
+    zone_price, zone_type, zone_touched = _find_entry_zone(
+        smc, current_price, recent_candles
     )
 
-    has_zone = (
-        zone_price is not None
-    )
+    has_zone = zone_price is not None
 
     # =====================================================
     # ENTRY PRICE
+    #
+    # - Belum ada zona valid            -> market di harga sekarang
+    # - Zona sudah kejemput/diretest    -> market di harga sekarang
+    # - Zona ada & belum kejemput       -> pending di harga zona
     # =====================================================
 
-    if has_zone:
-
+    if has_zone and not zone_touched:
         entry_price = zone_price
-
     else:
-
         entry_price = current_price
 
-    # =====================================================
-    # ORDER TYPE
-    # =====================================================
+    order_type, is_pending = _determine_order_type(
+        smc.bias,
+        entry_price,
+        current_price,
+        has_zone,
+        zone_touched,
+    )
 
-    order_type, is_pending = (
-        _determine_order_type(
-            smc.bias,
-            entry_price,
-            current_price,
-            has_zone,
-        )
+    entry_type = _build_entry_description(
+        order_type, is_pending, zone_touched
     )
 
     # =====================================================
-    # ENTRY DESCRIPTION
-    # =====================================================
-
-    entry_type = (
-        _build_entry_description(
-            order_type,
-            is_pending,
-            entry_candles,
-            entry_price,
-        )
-    )
-
-    # =====================================================
-    # CONFLUENCE
+    # CONFLUENCE / ALASAN (pakai reason bank biar variatif)
     # =====================================================
 
     if zone_type:
-
-        smc.confluences.append(
-            f"Entry mengacu ke {zone_type} "
-            f"terdekat dari harga sekarang"
+        reason_text = get_entry_reason(
+            bias=smc.bias,
+            zone_type=zone_type,
+            is_pending=is_pending,
+            touched=zone_touched,
+            seed=f"{now.isoformat()}-{zone_type}-{smc.bias}",
         )
+        smc.confluences.append(reason_text)
 
     if is_pending:
-
         smc.confluences.append(
-            f"Harga sekarang "
-            f"({round(current_price, 2)}) "
+            f"Harga sekarang ({round(current_price, 2)}) "
             f"masih berjarak dari zona optimal — "
             f"gunakan pending order, bukan market"
         )
@@ -563,94 +473,43 @@ def generate_signal(
     # =====================================================
 
     if smc.bias == "bullish":
-
-        sl = (
-            entry_price
-            - SL_DISTANCE
-        )
-
-        tp1 = (
-            entry_price
-            + TP1_DISTANCE
-        )
-
-        tp2 = (
-            entry_price
-            + TP2_DISTANCE
-        )
-
+        sl = entry_price - SL_DISTANCE
+        tp1 = entry_price + TP1_DISTANCE
+        tp2 = entry_price + TP2_DISTANCE
     else:
-
-        sl = (
-            entry_price
-            + SL_DISTANCE
-        )
-
-        tp1 = (
-            entry_price
-            - TP1_DISTANCE
-        )
-
-        tp2 = (
-            entry_price
-            - TP2_DISTANCE
-        )
-
-    # =====================================================
-    # TIME / SESSION
-    # =====================================================
+        sl = entry_price + SL_DISTANCE
+        tp1 = entry_price - TP1_DISTANCE
+        tp2 = entry_price - TP2_DISTANCE
 
     now = datetime.now(WIB)
+    session_name, session_note = _get_session_info(now)
 
-    session_name, session_note = (
-        _get_session_info(now)
+    # Tambahkan variasi catatan sesi (opsional, biar tidak monoton
+    # tiap kali sinyal keluar di sesi yang sama)
+    extra_note = get_session_extra_note(
+        session_name=session_name,
+        seed=f"{now.isoformat()}-{session_name}",
     )
-
-    # =====================================================
-    # RESULT
-    # =====================================================
+    if extra_note:
+        session_note = f"{session_note}. {extra_note}"
 
     return TradeSignal(
-
         timestamp=now,
-
         bias=smc.bias,
-
-        entry_price=round(
-            entry_price,
-            2,
-        ),
-
+        entry_price=round(entry_price, 2),
         entry_type=entry_type,
-
         order_type=order_type,
-
         is_pending=is_pending,
-
-        sl=round(
-            sl,
-            2,
-        ),
-
-        tp1=round(
-            tp1,
-            2,
-        ),
-
-        tp2=round(
-            tp2,
-            2,
-        ),
-
+        sl=round(sl, 2),
+        tp1=round(tp1, 2),
+        tp2=round(tp2, 2),
         probability=smc.score,
-
         reasons=smc.confluences,
-
         smc=smc,
-
         session_name=session_name,
-
         session_note=session_note,
+        zone_touched=zone_touched,
+        zone_type=zone_type,
     )
 
 
@@ -658,120 +517,53 @@ def generate_signal(
 # FORMAT SIGNAL
 # =========================================================
 
-def format_signal_message(
-    sig: TradeSignal,
-) -> str:
+def format_signal_message(sig: TradeSignal) -> str:
 
-    arrow = (
-        "🟢 BUY"
-        if sig.bias == "bullish"
-        else "🔴 SELL"
-    )
-
-    time_str = (
-        sig.timestamp.strftime(
-            "%d %b %Y, %H:%M WIB"
-        )
-    )
-
-    entry_label = (
-        f"🎯 Entry ({sig.order_type})"
-    )
+    arrow = "🟢 BUY" if sig.bias == "bullish" else "🔴 SELL"
+    time_str = sig.timestamp.strftime("%d %b %Y, %H:%M WIB")
+    entry_label = f"🎯 Entry ({sig.order_type})"
 
     lines = [
-
         "📊 *XAU AI INTELLIGENCE*",
-
         f"_Signal H1 — {time_str}_",
-
         f"_Sesi {sig.session_name}_",
-
         "",
-
         f"{arrow}  XAUUSD",
-
         f"Tipe entry : {sig.entry_type}",
-
         "",
-
         f"{entry_label} : `{int(sig.entry_price)}`",
-f"🛑 SL     : `{int(sig.sl)}`  (-{SL_PIPS} pip)",
-f"✅ TP1    : `{int(sig.tp1)}`  (+{TP1_PIPS} pip)",
-f"✅ TP2    : `{int(sig.tp2)}`  (+{TP2_PIPS} pip)",
+        f"🛑 SL     : `{int(sig.sl)}`  (-{SL_PIPS} pip)",
+        f"✅ TP1    : `{int(sig.tp1)}`  (+{TP1_PIPS} pip)",
+        f"✅ TP2    : `{int(sig.tp2)}`  (+{TP2_PIPS} pip)",
         "",
-
-        f"📈 Probabilitas: "
-        f"*{sig.probability}%*",
-
+        f"📈 Probabilitas: *{sig.probability}%*",
         "",
-
-        f"🕐 Catatan sesi "
-        f"{sig.session_name}:",
-
-        _wrap_reason(
-            sig.session_note
-        ),
-
+        f"🕐 Catatan sesi {sig.session_name}:",
+        _wrap_reason(sig.session_note),
         "",
-
         "🧠 Alasan entry:",
     ]
 
-    # =====================================================
-    # REASONS
-    # =====================================================
-
-    for i, reason in enumerate(
-        sig.reasons,
-        1,
-    ):
-
-        lines.append(
-            _wrap_reason(
-                f"{i}. {reason}"
-            )
-        )
-
-    # =====================================================
-    # PENDING
-    # =====================================================
+    for i, reason in enumerate(sig.reasons, 1):
+        lines.append(_wrap_reason(f"{i}. {reason}"))
 
     if sig.is_pending:
-
         lines += [
-
             "",
-
             _wrap_reason(
-                f"⏳ Pasang "
-                f"{sig.order_type} "
-                f"di harga entry di atas. "
-                f"Kalau dalam "
-                f"{PENDING_ORDER_TIMEOUT_MINUTES} "
-                f"menit belum kesentuh, "
-                f"signal ini otomatis "
-                f"dianggap batal "
+                f"⏳ Pasang {sig.order_type} di harga entry di atas. "
+                f"Kalau dalam {PENDING_ORDER_TIMEOUT_MINUTES} menit "
+                f"belum kesentuh, signal ini otomatis dianggap batal "
                 f"(skip, tidak perlu entry lagi)."
             ),
         ]
 
-    # =====================================================
-    # FOOTER
-    # =====================================================
-
     lines += [
-
         "",
-
-        "⚠️ _Signal berbasis AI "
-        "(SMC), bukan jaminan profit._",
-
+        "⚠️ _Signal berbasis AI (SMC), bukan jaminan profit._",
         "_Selalu gunakan money management pribadi._",
-
         "",
-
-        "🤖 _Signal ini dihasilkan "
-        "oleh AI Agent Gold_",
+        "🤖 _Signal ini dihasilkan oleh AI Agent Gold_",
     ]
 
     return "\n".join(lines)
@@ -781,44 +573,21 @@ f"✅ TP2    : `{int(sig.tp2)}`  (+{TP2_PIPS} pip)",
 # WRAP TEXT
 # =========================================================
 
-def _wrap_reason(
-    text: str,
-    width: int = 34,
-) -> str:
+def _wrap_reason(text: str, width: int = 34) -> str:
 
     words = text.split(" ")
-
     lines = []
-
     current = ""
 
     for word in words:
-
-        if (
-            len(current)
-            + len(word)
-            + 1
-            > width
-        ):
-
+        if len(current) + len(word) + 1 > width:
             if current:
-
-                lines.append(
-                    current
-                )
-
+                lines.append(current)
             current = word
-
         else:
-
-            current = (
-                f"{current} {word}"
-            ).strip()
+            current = f"{current} {word}".strip()
 
     if current:
-
-        lines.append(
-            current
-        )
+        lines.append(current)
 
     return "\n   ".join(lines)
