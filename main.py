@@ -20,7 +20,7 @@ import threading
 import logging
 import requests
 
-from config import BOT_TOKEN
+from config import TELEGRAM_BOT_TOKEN
 
 from scheduler import (
     start,
@@ -57,9 +57,8 @@ logger = logging.getLogger(
 # =========================================================
 
 TELEGRAM_API = (
-    f"https://api.telegram.org/bot{BOT_TOKEN}"
+    f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}"
 )
-
 
 # =========================================================
 # SEND MESSAGE
