@@ -694,21 +694,10 @@ def format_signal_message(
 
         "",
 
-        f"{entry_label} : "
-        f"`{sig.entry_price}`",
-
-        f"🛑 SL     : "
-        f"`{sig.sl}`  "
-        f"(-{SL_PIPS} pip)",
-
-        f"✅ TP1    : "
-        f"`{sig.tp1}`  "
-        f"(+{TP1_PIPS} pip)",
-
-        f"✅ TP2    : "
-        f"`{sig.tp2}`  "
-        f"(+{TP2_PIPS} pip)",
-
+        f"{entry_label} : `{int(sig.entry_price)}`",
+f"🛑 SL     : `{int(sig.sl)}`  (-{SL_PIPS} pip)",
+f"✅ TP1    : `{int(sig.tp1)}`  (+{TP1_PIPS} pip)",
+f"✅ TP2    : `{int(sig.tp2)}`  (+{TP2_PIPS} pip)",
         "",
 
         f"📈 Probabilitas: "
