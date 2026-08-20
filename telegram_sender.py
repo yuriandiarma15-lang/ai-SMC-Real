@@ -12,13 +12,12 @@ def send_message(text: str) -> bool:
     """
     Kirim pesan ke Telegram.
 
-    Return:
-        True  = berhasil
-        False = gagal
+    True  = berhasil
+    False = gagal
     """
 
     # ==========================================
-    # CEK CONFIG
+    # CEK TOKEN & CHAT ID
     # ==========================================
 
     if not TELEGRAM_BOT_TOKEN:
@@ -51,19 +50,19 @@ def send_message(text: str) -> bool:
 
     try:
 
-        resp = requests.post(
+        response = requests.post(
             url,
             json=payload,
             timeout=15,
         )
 
         # ======================================
-        # SUCCESS
+        # BERHASIL
         # ======================================
 
-        if resp.status_code == 200:
+        if response.status_code == 200:
 
-            data = resp.json()
+            data = response.json()
 
             if data.get("ok"):
 
@@ -74,21 +73,21 @@ def send_message(text: str) -> bool:
                 return True
 
             logger.error(
-                "Telegram API mengembalikan ok=false: %s",
-                resp.text,
+                "Telegram API menolak pesan: %s",
+                response.text,
             )
 
             return False
 
         # ======================================
-        # ERROR
+        # GAGAL
         # ======================================
 
         logger.error(
             "Gagal kirim pesan Telegram. "
             "HTTP %s: %s",
-            resp.status_code,
-            resp.text,
+            response.status_code,
+            response.text,
         )
 
         return False
@@ -96,7 +95,7 @@ def send_message(text: str) -> bool:
     except requests.RequestException as e:
 
         logger.exception(
-            "Error koneksi ke Telegram: %s",
+            "Koneksi ke Telegram gagal: %s",
             e,
         )
 
